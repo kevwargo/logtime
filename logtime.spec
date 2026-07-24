@@ -1,5 +1,5 @@
 Name:           logtime
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Execute a command and log its output with timestamps
 

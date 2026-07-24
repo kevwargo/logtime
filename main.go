@@ -119,7 +119,7 @@ func (r *runner) openLog() error {
 	}
 
 	r.out = f
-	r.tee = true
+	r.tee = r.Tee
 
 	return nil
 }
