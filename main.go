@@ -14,6 +14,7 @@ import (
 	"github.com/kevwargo/logtime/internal/tasks"
 	"github.com/ncruces/go-strftime"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -30,6 +31,12 @@ func main() {
 	cmd.Flags().BoolVarP(&r.Append, "append", "a", false, "Append to file")
 	cmd.Flags().BoolVar(&r.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
 	cmd.Flags().StringVarP(&r.Format, "format", "f", "%Y%m%d-%H%M%S.%L", "Redirect output here")
+	cmd.Flags().BoolVar(
+		&r.Subreaper,
+		"set-subreaper",
+		false,
+		"Set PR_SET_CHILD_SUBREAPER flag before calling subprocess",
+	)
 
 	if err := cmd.Execute(); err != nil {
 		log.Fatal(err)
@@ -37,14 +44,16 @@ func main() {
 }
 
 type runner struct {
-	File    string
-	Format  string
-	Append  bool
-	TeeFlag bool
+	File      string
+	Format    string
+	Append    bool
+	TeeFlag   bool
+	Subreaper bool
 
-	mu  sync.Mutex
-	out *os.File
-	tee bool
+	mu        sync.Mutex
+	out       *os.File
+	tee       bool
+	subCmdPID int
 }
 
 func (r *runner) run(args []string) error {
@@ -59,14 +68,27 @@ func (r *runner) run(args []string) error {
 		return err
 	}
 
+	if r.Subreaper {
+		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+			return fmt.Errorf("setting subreaper flag: %w", err)
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting %v: %w", args, err)
 	}
 
+	r.subCmdPID = cmd.Process.Pid
+
 	var tg tasks.TaskGroup
 	tg.Add(outPipe.runUntilEOF)
 	tg.Add(errPipe.runUntilEOF)
-	tg.Add(cmd.Wait)
+
+	if r.Subreaper {
+		tg.Add(r.waitPIDs)
+	} else {
+		tg.Add(cmd.Wait)
+	}
 
 	return tg.Run()
 }
@@ -133,6 +155,34 @@ func (r *runner) log(f string, args ...any) {
 	if r.tee {
 		fmt.Printf("%s: "+f, args...)
 	}
+}
+
+func (r *runner) waitPIDs() error {
+	var (
+		status unix.WaitStatus
+		wpid   int
+		err    error
+	)
+
+	for {
+		wpid, err = unix.Wait4(-1, &status, 0, nil)
+		if err != nil {
+			break
+		}
+
+		if wpid == r.subCmdPID {
+			r.log("Subcommand exited: code:%d, signal:%s", status.ExitStatus(), status.Signal().String())
+		} else {
+			r.log("Child %d exited: code:%d, signal:%s", wpid, status.ExitStatus(), status.Signal().String())
+		}
+	}
+
+	if err == unix.ECHILD {
+		r.log("All children exited")
+		err = nil
+	}
+
+	return err
 }
 
 type pipe struct {

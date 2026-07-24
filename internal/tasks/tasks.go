@@ -27,8 +27,7 @@ func (tg *TaskGroup) Run() error {
 	)
 
 	for _, t := range tg.tasks {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			err := t()
 			if err != nil {
 				mu.Lock()
@@ -36,7 +35,7 @@ func (tg *TaskGroup) Run() error {
 
 				errs = append(errs, err)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
