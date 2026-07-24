@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kevwargo/logtime/internal/tasks"
 	"github.com/ncruces/go-strftime"
 	"github.com/spf13/cobra"
 )
@@ -28,7 +28,7 @@ func main() {
 
 	cmd.Flags().StringVarP(&r.File, "filename", "o", "", "Redirect output here")
 	cmd.Flags().BoolVarP(&r.Append, "append", "a", false, "Append to file")
-	cmd.Flags().BoolVar(&r.Tee, "tee", false, "Duplicate logs to stdout in addition to writing to file")
+	cmd.Flags().BoolVar(&r.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
 	cmd.Flags().StringVarP(&r.Format, "format", "f", "%Y%m%d-%H%M%S.%L", "Redirect output here")
 
 	if err := cmd.Execute(); err != nil {
@@ -37,10 +37,10 @@ func main() {
 }
 
 type runner struct {
-	File   string
-	Format string
-	Append bool
-	Tee    bool
+	File    string
+	Format  string
+	Append  bool
+	TeeFlag bool
 
 	mu  sync.Mutex
 	out *os.File
@@ -63,20 +63,12 @@ func (r *runner) run(args []string) error {
 		return fmt.Errorf("starting %v: %w", args, err)
 	}
 
-	errC := make(chan error, 2)
-	if err := outPipe.start(errC); err != nil {
-		errC <- err
-	}
-	if err := errPipe.start(errC); err != nil {
-		errC <- err
-	}
+	var tg tasks.TaskGroup
+	tg.Add(outPipe.runUntilEOF)
+	tg.Add(errPipe.runUntilEOF)
+	tg.Add(cmd.Wait)
 
-	var errs []error
-	for range 2 {
-		errs = append(errs, <-errC)
-	}
-
-	return errors.Join(errs...)
+	return tg.Run()
 }
 
 func (r *runner) openPipe(target *io.Writer, name string) (*pipe, error) {
@@ -105,6 +97,8 @@ func (r *runner) openLog() error {
 
 	if r.File == "" {
 		r.out = os.Stdout
+		r.tee = false
+
 		return nil
 	}
 
@@ -119,7 +113,7 @@ func (r *runner) openLog() error {
 	}
 
 	r.out = f
-	r.tee = r.Tee
+	r.tee = r.TeeFlag
 
 	return nil
 }
@@ -148,7 +142,7 @@ type pipe struct {
 	pw   *os.File
 }
 
-func (p *pipe) start(errC chan error) error {
+func (p *pipe) runUntilEOF() error {
 	if err := p.pw.Close(); err != nil {
 		return fmt.Errorf("closing parent write pipe: %w", err)
 	}
@@ -156,13 +150,6 @@ func (p *pipe) start(errC chan error) error {
 	if err := p.r.openLog(); err != nil {
 		return err
 	}
-
-	go p.runUntilEOF(errC)
-
-	return nil
-}
-
-func (p *pipe) runUntilEOF(errC chan error) {
 	p.r.log("starting %q pipe", p.name)
 
 	sc := bufio.NewScanner(p.pr)
@@ -175,5 +162,5 @@ func (p *pipe) runUntilEOF(errC chan error) {
 		err = fmt.Errorf("in %q pipe: %w", p.name, err)
 	}
 
-	errC <- err
+	return err
 }
