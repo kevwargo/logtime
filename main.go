@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -26,16 +27,18 @@ func main() {
 	cmd := &cobra.Command{
 		Use: "logtime [flags] -- command [arg1 [arg2 ...]]",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return r.run(args)
+			r.cfg.Subcommand = args
+
+			return r.run()
 		},
 	}
 
-	cmd.Flags().StringVarP(&r.File, "filename", "o", "", "Redirect output here")
-	cmd.Flags().BoolVarP(&r.Append, "append", "a", false, "Append to file")
-	cmd.Flags().BoolVar(&r.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
-	cmd.Flags().StringVarP(&r.Format, "format", "f", "[%Y-%m-%d %H:%M:%S.%L] ", "Prefix format")
+	cmd.Flags().StringVarP(&r.cfg.File, "filename", "o", "", "Redirect output here")
+	cmd.Flags().BoolVarP(&r.cfg.Append, "append", "a", false, "Append to file")
+	cmd.Flags().BoolVar(&r.cfg.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
+	cmd.Flags().StringVarP(&r.cfg.Format, "format", "f", "[%Y-%m-%d %H:%M:%S.%L] ", "Prefix format")
 	cmd.Flags().BoolVar(
-		&r.Subreaper,
+		&r.cfg.Subreaper,
 		"set-subreaper",
 		false,
 		"Set PR_SET_CHILD_SUBREAPER flag before calling subprocess",
@@ -46,13 +49,17 @@ func main() {
 	}
 }
 
-type runner struct {
-	File      string
-	Format    string
-	Append    bool
-	TeeFlag   bool
-	Subreaper bool
+type config struct {
+	File       string
+	Format     string
+	Append     bool
+	TeeFlag    bool
+	Subreaper  bool
+	Subcommand []string
+}
 
+type runner struct {
+	cfg       config
 	mu        sync.Mutex
 	out       *os.File
 	tee       bool
@@ -60,14 +67,15 @@ type runner struct {
 	subCmdPID int
 }
 
-func (r *runner) run(args []string) error {
-	if r.File != "" && os.Getenv(workerEnvVar) == "" {
+func (r *runner) run() error {
+	r.isWorker = os.Getenv(workerEnvVar) != ""
+	os.Unsetenv(workerEnvVar)
+
+	if r.cfg.File != "" && !r.isWorker {
 		return r.runForeground()
 	}
 
-	r.isWorker = os.Getenv(workerEnvVar) != ""
-
-	return r.runWorker(args)
+	return r.runWorker()
 }
 
 // runForeground re-execs logtime as a background worker and waits for the
@@ -78,10 +86,14 @@ func (r *runner) runForeground() error {
 		return fmt.Errorf("resolving own executable: %w", err)
 	}
 
-	workerCmd := exec.Command(self, os.Args[1:]...)
+	workerCmd := exec.Command(self)
 	workerCmd.Env = append(os.Environ(), workerEnvVar+"=1")
-	workerCmd.Stdin = os.Stdin
 	workerCmd.Stderr = os.Stderr
+
+	ipcWriter, err := workerCmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("creating worker stdin pipe: %w", err)
+	}
 
 	ipcReader, err := workerCmd.StdoutPipe()
 	if err != nil {
@@ -91,6 +103,12 @@ func (r *runner) runForeground() error {
 	if err := workerCmd.Start(); err != nil {
 		return fmt.Errorf("starting worker: %w", err)
 	}
+
+	enc := json.NewEncoder(ipcWriter)
+	if err := enc.Encode(r.cfg); err != nil {
+		return fmt.Errorf("encoding config to json: %w", err)
+	}
+	ipcWriter.Close()
 
 	// Read IPC messages from the worker.
 	// Protocol:
@@ -123,17 +141,21 @@ func (r *runner) runForeground() error {
 // runWorker is the actual logging process. It creates pipes, starts the
 // subcommand, reports status to the foreground via stdout, and continues
 // reading pipes and reaping children until everything is done.
-func (r *runner) runWorker(args []string) error {
-	// Remove the worker env var so the subcommand doesn't inherit it.
-	os.Unsetenv(workerEnvVar)
+func (r *runner) runWorker() error {
+	if r.isWorker {
+		dec := json.NewDecoder(os.Stdin)
+		if err := dec.Decode(&r.cfg); err != nil {
+			return fmt.Errorf("decoding config from stdin: %w", err)
+		}
+	}
 
 	// When --filename is specified, always enable subreaper (we're the
 	// background worker responsible for all descendants).
-	if r.File != "" {
-		r.Subreaper = true
+	if r.cfg.File != "" {
+		r.cfg.Subreaper = true
 	}
 
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command(r.cfg.Subcommand[0], r.cfg.Subcommand[1:]...)
 
 	outPipe, err := r.openPipe(&cmd.Stdout, "stdout")
 	if err != nil {
@@ -144,14 +166,14 @@ func (r *runner) runWorker(args []string) error {
 		return err
 	}
 
-	if r.Subreaper {
+	if r.cfg.Subreaper {
 		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 			return fmt.Errorf("setting subreaper flag: %w", err)
 		}
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting %v: %w", args, err)
+		return fmt.Errorf("starting %v: %w", r.cfg.Subcommand, err)
 	}
 
 	r.subCmdPID = cmd.Process.Pid
@@ -165,7 +187,7 @@ func (r *runner) runWorker(args []string) error {
 	tg.Add(outPipe.runUntilEOF)
 	tg.Add(errPipe.runUntilEOF)
 
-	if r.Subreaper {
+	if r.cfg.Subreaper {
 		tg.Add(r.waitPIDs)
 	} else {
 		tg.Add(cmd.Wait)
@@ -253,7 +275,7 @@ func (r *runner) openLog() error {
 		return nil
 	}
 
-	if r.File == "" {
+	if r.cfg.File == "" {
 		r.out = os.Stdout
 		r.tee = false
 
@@ -261,17 +283,17 @@ func (r *runner) openLog() error {
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE
-	if r.Append {
+	if r.cfg.Append {
 		flags |= os.O_APPEND
 	}
 
-	f, err := os.OpenFile(r.File, flags, 0o644)
+	f, err := os.OpenFile(r.cfg.File, flags, 0o644)
 	if err != nil {
-		return fmt.Errorf("opening log output %q: %w", r.File, err)
+		return fmt.Errorf("opening log output %q: %w", r.cfg.File, err)
 	}
 
 	r.out = f
-	r.tee = r.TeeFlag
+	r.tee = r.cfg.TeeFlag
 
 	return nil
 }
@@ -284,7 +306,7 @@ func (r *runner) log(f string, args ...any) {
 		f += "\n"
 	}
 
-	prefix := strftime.Format(r.Format, time.Now())
+	prefix := strftime.Format(r.cfg.Format, time.Now())
 	args = append([]any{prefix}, args...)
 
 	fmt.Fprintf(r.out, "%s"+f, args...)
