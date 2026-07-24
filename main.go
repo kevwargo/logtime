@@ -30,7 +30,7 @@ func main() {
 	cmd.Flags().StringVarP(&r.File, "filename", "o", "", "Redirect output here")
 	cmd.Flags().BoolVarP(&r.Append, "append", "a", false, "Append to file")
 	cmd.Flags().BoolVar(&r.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
-	cmd.Flags().StringVarP(&r.Format, "format", "f", "%Y%m%d-%H%M%S.%L", "Redirect output here")
+	cmd.Flags().StringVarP(&r.Format, "format", "f", "[%Y-%m-%d %H:%M:%S.%L] ", "Prefix format")
 	cmd.Flags().BoolVar(
 		&r.Subreaper,
 		"set-subreaper",
@@ -148,10 +148,10 @@ func (r *runner) log(f string, args ...any) {
 		f += "\n"
 	}
 
-	now := strftime.Format(r.Format, time.Now())
-	args = append([]any{now}, args...)
+	prefix := strftime.Format(r.Format, time.Now())
+	args = append([]any{prefix}, args...)
 
-	fmt.Fprintf(r.out, "%s: "+f, args...)
+	fmt.Fprintf(r.out, "%s"+f, args...)
 	if r.tee {
 		fmt.Printf("%s: "+f, args...)
 	}
