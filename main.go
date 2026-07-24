@@ -28,6 +28,7 @@ func main() {
 
 	cmd.Flags().StringVarP(&r.File, "filename", "o", "", "Redirect output here")
 	cmd.Flags().BoolVarP(&r.Append, "append", "a", false, "Append to file")
+	cmd.Flags().BoolVar(&r.Tee, "tee", false, "Duplicate logs to stdout in addition to writing to file")
 	cmd.Flags().StringVarP(&r.Format, "format", "f", "%Y%m%d-%H%M%S.%L", "Redirect output here")
 
 	if err := cmd.Execute(); err != nil {
@@ -39,9 +40,11 @@ type runner struct {
 	File   string
 	Format string
 	Append bool
+	Tee    bool
 
 	mu  sync.Mutex
 	out *os.File
+	tee bool
 }
 
 func (r *runner) run(args []string) error {
@@ -76,13 +79,6 @@ func (r *runner) run(args []string) error {
 	return errors.Join(errs...)
 }
 
-type pipe struct {
-	r    *runner
-	name string
-	pr   *os.File
-	pw   *os.File
-}
-
 func (r *runner) openPipe(target *io.Writer, name string) (*pipe, error) {
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -99,37 +95,7 @@ func (r *runner) openPipe(target *io.Writer, name string) (*pipe, error) {
 	}, nil
 }
 
-func (p *pipe) start(errC chan error) error {
-	if err := p.pw.Close(); err != nil {
-		return fmt.Errorf("closing parent write pipe: %w", err)
-	}
-
-	if err := p.r.openOut(); err != nil {
-		return err
-	}
-
-	go p.runUntilEOF(errC)
-
-	return nil
-}
-
-func (p *pipe) runUntilEOF(errC chan error) {
-	p.r.log("starting %q pipe", p.name)
-
-	sc := bufio.NewScanner(p.pr)
-	for sc.Scan() {
-		p.r.log("[%s] line: %q", p.name, sc.Text())
-	}
-
-	err := sc.Err()
-	if err != nil {
-		err = fmt.Errorf("in %q pipe: %w", p.name, err)
-	}
-
-	errC <- err
-}
-
-func (r *runner) openOut() error {
+func (r *runner) openLog() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -153,6 +119,7 @@ func (r *runner) openOut() error {
 	}
 
 	r.out = f
+	r.tee = true
 
 	return nil
 }
@@ -169,4 +136,44 @@ func (r *runner) log(f string, args ...any) {
 	args = append([]any{now}, args...)
 
 	fmt.Fprintf(r.out, "%s: "+f, args...)
+	if r.tee {
+		fmt.Printf("%s: "+f, args...)
+	}
+}
+
+type pipe struct {
+	r    *runner
+	name string
+	pr   *os.File
+	pw   *os.File
+}
+
+func (p *pipe) start(errC chan error) error {
+	if err := p.pw.Close(); err != nil {
+		return fmt.Errorf("closing parent write pipe: %w", err)
+	}
+
+	if err := p.r.openLog(); err != nil {
+		return err
+	}
+
+	go p.runUntilEOF(errC)
+
+	return nil
+}
+
+func (p *pipe) runUntilEOF(errC chan error) {
+	p.r.log("starting %q pipe", p.name)
+
+	sc := bufio.NewScanner(p.pr)
+	for sc.Scan() {
+		p.r.log("[%s] line: %q", p.name, sc.Text())
+	}
+
+	err := sc.Err()
+	if err != nil {
+		err = fmt.Errorf("in %q pipe: %w", p.name, err)
+	}
+
+	errC <- err
 }
