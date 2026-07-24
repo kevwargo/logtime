@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 )
+
+const workerEnvVar = "_LOGTIME_WORKER"
 
 func main() {
 	var r runner
@@ -53,10 +56,83 @@ type runner struct {
 	mu        sync.Mutex
 	out       *os.File
 	tee       bool
+	isWorker  bool
 	subCmdPID int
 }
 
 func (r *runner) run(args []string) error {
+	if r.File != "" && os.Getenv(workerEnvVar) == "" {
+		return r.runForeground()
+	}
+
+	r.isWorker = os.Getenv(workerEnvVar) != ""
+
+	return r.runWorker(args)
+}
+
+// runForeground re-execs logtime as a background worker and waits for the
+// subcommand to exit (reported by the worker via its stdout).
+func (r *runner) runForeground() error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolving own executable: %w", err)
+	}
+
+	workerCmd := exec.Command(self, os.Args[1:]...)
+	workerCmd.Env = append(os.Environ(), workerEnvVar+"=1")
+	workerCmd.Stdin = os.Stdin
+	workerCmd.Stderr = os.Stderr
+
+	ipcReader, err := workerCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("creating worker stdout pipe: %w", err)
+	}
+
+	if err := workerCmd.Start(); err != nil {
+		return fmt.Errorf("starting worker: %w", err)
+	}
+
+	// Read IPC messages from the worker.
+	// Protocol:
+	//   "started <pid>" - subcommand has been started
+	//   "exited <code>" - subcommand has exited with given code
+	exitCode := 0
+	sc := bufio.NewScanner(ipcReader)
+	for sc.Scan() {
+		line := sc.Text()
+		if code, ok := strings.CutPrefix(line, "exited "); ok {
+			exitCode, _ = strconv.Atoi(code)
+			break
+		}
+	}
+
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("reading worker IPC: %w", err)
+	}
+
+	// We don't call workerCmd.Wait() — the worker continues in the background.
+	// Once we exit, the worker gets reparented to PID 1.
+
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+
+	return nil
+}
+
+// runWorker is the actual logging process. It creates pipes, starts the
+// subcommand, reports status to the foreground via stdout, and continues
+// reading pipes and reaping children until everything is done.
+func (r *runner) runWorker(args []string) error {
+	// Remove the worker env var so the subcommand doesn't inherit it.
+	os.Unsetenv(workerEnvVar)
+
+	// When --filename is specified, always enable subreaper (we're the
+	// background worker responsible for all descendants).
+	if r.File != "" {
+		r.Subreaper = true
+	}
+
 	cmd := exec.Command(args[0], args[1:]...)
 
 	outPipe, err := r.openPipe(&cmd.Stdout, "stdout")
@@ -80,6 +156,11 @@ func (r *runner) run(args []string) error {
 
 	r.subCmdPID = cmd.Process.Pid
 
+	// Notify foreground that the subcommand started (only in worker mode).
+	if r.isWorker {
+		fmt.Fprintf(os.Stdout, "started %d\n", r.subCmdPID)
+	}
+
 	var tg tasks.TaskGroup
 	tg.Add(outPipe.runUntilEOF)
 	tg.Add(errPipe.runUntilEOF)
@@ -91,6 +172,61 @@ func (r *runner) run(args []string) error {
 	}
 
 	return tg.Run()
+}
+
+// waitPIDs reaps all children (direct and reparented) until none remain.
+// It reports the subcommand's exit to the foreground via stdout IPC.
+func (r *runner) waitPIDs() error {
+	var (
+		status unix.WaitStatus
+		wpid   int
+		err    error
+	)
+
+	stdoutClosed := false
+
+	for {
+		wpid, err = unix.Wait4(-1, &status, 0, nil)
+		if err != nil {
+			break
+		}
+
+		if wpid == r.subCmdPID {
+			r.log("Subcommand exited: code:%d, signal:%s", status.ExitStatus(), status.Signal().String())
+			if r.isWorker {
+				// Notify foreground of subcommand exit.
+				fmt.Fprintf(os.Stdout, "exited %d\n", status.ExitStatus())
+				// Redirect stdout to /dev/null to prevent SIGPIPE if
+				// the foreground exits and breaks the IPC pipe.
+				r.closeStdout()
+				stdoutClosed = true
+			}
+		} else {
+			r.log("Child %d exited: code:%d, signal:%s", wpid, status.ExitStatus(), status.Signal().String())
+		}
+	}
+
+	if !stdoutClosed && r.isWorker {
+		r.closeStdout()
+	}
+
+	if err == unix.ECHILD {
+		r.log("All children exited")
+		err = nil
+	}
+
+	return err
+}
+
+// closeStdout redirects FD 1 to /dev/null to prevent SIGPIPE on accidental
+// writes after the foreground process has exited.
+func (r *runner) closeStdout() {
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		return
+	}
+	unix.Dup2(int(devnull.Fd()), 1)
+	devnull.Close()
 }
 
 func (r *runner) openPipe(target *io.Writer, name string) (*pipe, error) {
@@ -153,36 +289,8 @@ func (r *runner) log(f string, args ...any) {
 
 	fmt.Fprintf(r.out, "%s"+f, args...)
 	if r.tee {
-		fmt.Printf("%s: "+f, args...)
+		fmt.Printf("%s"+f, args...)
 	}
-}
-
-func (r *runner) waitPIDs() error {
-	var (
-		status unix.WaitStatus
-		wpid   int
-		err    error
-	)
-
-	for {
-		wpid, err = unix.Wait4(-1, &status, 0, nil)
-		if err != nil {
-			break
-		}
-
-		if wpid == r.subCmdPID {
-			r.log("Subcommand exited: code:%d, signal:%s", status.ExitStatus(), status.Signal().String())
-		} else {
-			r.log("Child %d exited: code:%d, signal:%s", wpid, status.ExitStatus(), status.Signal().String())
-		}
-	}
-
-	if err == unix.ECHILD {
-		r.log("All children exited")
-		err = nil
-	}
-
-	return err
 }
 
 type pipe struct {
