@@ -11,6 +11,10 @@ type TaskGroup struct {
 	tasks []Task
 }
 
+func NewGroup(tasks ...Task) *TaskGroup {
+	return &TaskGroup{tasks: tasks}
+}
+
 func (tg *TaskGroup) Add(t Task) {
 	tg.tasks = append(tg.tasks, t)
 }

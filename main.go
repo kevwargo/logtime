@@ -183,10 +183,7 @@ func (r *runner) runWorker() error {
 		fmt.Fprintf(os.Stdout, "started %d\n", r.subCmdPID)
 	}
 
-	var tg tasks.TaskGroup
-	tg.Add(outPipe.runUntilEOF)
-	tg.Add(errPipe.runUntilEOF)
-
+	tg := tasks.NewGroup(outPipe.runUntilEOF, errPipe.runUntilEOF)
 	if r.cfg.Subreaper {
 		tg.Add(r.waitPIDs)
 	} else {
