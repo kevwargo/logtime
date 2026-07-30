@@ -299,16 +299,17 @@ func (r *runner) log(f string, args ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !strings.HasSuffix(f, "\n") {
-		f += "\n"
-	}
-
 	prefix := strftime.Format(r.cfg.Format, time.Now())
 	args = append([]any{prefix}, args...)
 
-	fmt.Fprintf(r.out, "%s"+f, args...)
+	msg := fmt.Sprintf(f, args...)
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+
+	fmt.Fprint(r.out, msg)
 	if r.tee {
-		fmt.Printf("%s"+f, args...)
+		fmt.Print(msg)
 	}
 }
 
@@ -331,7 +332,7 @@ func (p *pipe) runUntilEOF() error {
 
 	sc := bufio.NewScanner(p.pr)
 	for sc.Scan() {
-		p.r.log("[%s] line: %q", p.name, sc.Text())
+		p.r.log("[%s] %s", p.name, sc.Text())
 	}
 
 	err := sc.Err()
