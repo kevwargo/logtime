@@ -331,7 +331,7 @@ func (p *pipe) runUntilEOF() error {
 
 	sc := bufio.NewScanner(p.pr)
 	for sc.Scan() {
-		p.r.log("[%s] line: %q", p.name, sc.Text())
+		p.r.log("[%s] %s", p.name, sc.Text())
 	}
 
 	err := sc.Err()
