@@ -27,7 +27,7 @@ func main() {
 	cmd := &cobra.Command{
 		Use: "logtime [flags] -- command [arg1 [arg2 ...]]",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			r.cfg.Subcommand = args
+			r.cfg.Command = args
 
 			return r.run()
 		},
@@ -50,21 +50,21 @@ func main() {
 }
 
 type config struct {
-	File       string
-	Format     string
-	Append     bool
-	TeeFlag    bool
-	Subreaper  bool
-	Subcommand []string
+	File      string
+	Format    string
+	Append    bool
+	TeeFlag   bool
+	Subreaper bool
+	Command   []string
 }
 
 type runner struct {
-	cfg       config
-	mu        sync.Mutex
-	out       *os.File
-	tee       bool
-	isWorker  bool
-	subCmdPID int
+	cfg      config
+	mu       sync.Mutex
+	out      *os.File
+	tee      bool
+	isWorker bool
+	cmdPID   int
 }
 
 func (r *runner) run() error {
@@ -79,7 +79,7 @@ func (r *runner) run() error {
 }
 
 // runForeground re-execs logtime as a background worker and waits for the
-// subcommand to exit (reported by the worker via its stdout).
+// command to exit (reported by the worker via its stdout).
 func (r *runner) runForeground() error {
 	self, err := os.Executable()
 	if err != nil {
@@ -112,8 +112,8 @@ func (r *runner) runForeground() error {
 
 	// Read IPC messages from the worker.
 	// Protocol:
-	//   "started <pid>" - subcommand has been started
-	//   "exited <code>" - subcommand has exited with given code
+	//   "started <pid>" - command has been started
+	//   "exited <code>" - command has exited with given code
 	exitCode := 0
 	sc := bufio.NewScanner(ipcReader)
 	for sc.Scan() {
@@ -139,7 +139,7 @@ func (r *runner) runForeground() error {
 }
 
 // runWorker is the actual logging process. It creates pipes, starts the
-// subcommand, reports status to the foreground via stdout, and continues
+// command, reports status to the foreground via stdout, and continues
 // reading pipes and reaping children until everything is done.
 func (r *runner) runWorker() error {
 	if r.isWorker {
@@ -155,7 +155,7 @@ func (r *runner) runWorker() error {
 		r.cfg.Subreaper = true
 	}
 
-	cmd := exec.Command(r.cfg.Subcommand[0], r.cfg.Subcommand[1:]...)
+	cmd := exec.Command(r.cfg.Command[0], r.cfg.Command[1:]...)
 
 	outPipe, err := r.openPipe(&cmd.Stdout, "stdout")
 	if err != nil {
@@ -173,14 +173,14 @@ func (r *runner) runWorker() error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting %v: %w", r.cfg.Subcommand, err)
+		return fmt.Errorf("starting %v: %w", r.cfg.Command, err)
 	}
 
-	r.subCmdPID = cmd.Process.Pid
+	r.cmdPID = cmd.Process.Pid
 
-	// Notify foreground that the subcommand started (only in worker mode).
+	// Notify foreground that the command started (only in worker mode).
 	if r.isWorker {
-		fmt.Fprintf(os.Stdout, "started %d\n", r.subCmdPID)
+		fmt.Fprintf(os.Stdout, "started %d\n", r.cmdPID)
 	}
 
 	tg := tasks.NewGroup(outPipe.runUntilEOF, errPipe.runUntilEOF)
@@ -194,7 +194,7 @@ func (r *runner) runWorker() error {
 }
 
 // waitPIDs reaps all children (direct and reparented) until none remain.
-// It reports the subcommand's exit to the foreground via stdout IPC.
+// It reports the command's exit to the foreground via stdout IPC.
 func (r *runner) waitPIDs() error {
 	var (
 		status unix.WaitStatus
@@ -210,10 +210,10 @@ func (r *runner) waitPIDs() error {
 			break
 		}
 
-		if wpid == r.subCmdPID {
-			r.log("Subcommand exited: code:%d, signal:%s", status.ExitStatus(), status.Signal().String())
+		if wpid == r.cmdPID {
+			r.log("Entrypoint command exited: code:%d, signal:%s", status.ExitStatus(), status.Signal().String())
 			if r.isWorker {
-				// Notify foreground of subcommand exit.
+				// Notify foreground of command exit.
 				fmt.Fprintf(os.Stdout, "exited %d\n", status.ExitStatus())
 				// Redirect stdout to /dev/null to prevent SIGPIPE if
 				// the foreground exits and breaks the IPC pipe.
@@ -221,7 +221,7 @@ func (r *runner) waitPIDs() error {
 				stdoutClosed = true
 			}
 		} else {
-			r.log("Child %d exited: code:%d, signal:%s", wpid, status.ExitStatus(), status.Signal().String())
+			r.log("Subcommand %d exited: code:%d, signal:%s", wpid, status.ExitStatus(), status.Signal().String())
 		}
 	}
 
