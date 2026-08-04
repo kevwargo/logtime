@@ -3,6 +3,7 @@ TOPDIR := $(CURDIR)/_rpmbuild
 .PHONY: build-rpm install-rpm
 
 build-rpm:
+	go build
 	rm -rf $(TOPDIR)
 	mkdir -p $(TOPDIR)/{BUILD,RPMS,SRPMS,SPECS,SOURCES}
 	rpmbuild -bb logtime.spec \

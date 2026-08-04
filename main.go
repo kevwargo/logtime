@@ -36,7 +36,7 @@ func main() {
 	cmd.Flags().StringVarP(&r.cfg.File, "filename", "o", "", "Redirect output here")
 	cmd.Flags().BoolVarP(&r.cfg.Append, "append", "a", false, "Append to file")
 	cmd.Flags().BoolVar(&r.cfg.TeeFlag, "tee", false, "Duplicate logs to stdout in addition to writing to file")
-	cmd.Flags().StringVarP(&r.cfg.Format, "format", "f", "[%Y-%m-%d %H:%M:%S.%L] ", "Prefix format")
+	cmd.Flags().StringVarP(&r.cfg.Format, "format", "f", "[%Y-%m-%d %H:%M:%S.%L] ", "Datetime prefix format")
 	cmd.Flags().BoolVar(
 		&r.cfg.Subreaper,
 		"set-subreaper",
@@ -302,7 +302,7 @@ func (r *runner) log(f string, args ...any) {
 	prefix := strftime.Format(r.cfg.Format, time.Now())
 	args = append([]any{prefix}, args...)
 
-	msg := fmt.Sprintf(f, args...)
+	msg := fmt.Sprintf("%s"+f, args...)
 	if !strings.HasSuffix(msg, "\n") {
 		msg += "\n"
 	}
